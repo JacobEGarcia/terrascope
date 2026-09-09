@@ -1,0 +1,165 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>TERRASCOPE — planetary intelligence</title>
+<meta name="description" content="Near-real-time NASA Earth-observation events as a decisive disaster-briefing command center.">
+<link rel="icon" href="data:image/svg+xml,<svg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 100 100'><text y='.9em' font-size='90'>🛰️</text></svg>">
+<link rel="stylesheet" href="https://unpkg.com/leaflet@1.9.4/dist/leaflet.css">
+<style>
+  :root{
+    --bg:#090b0e; --panel:#0e1116; --ink:#e8e6e1; --dim:#78808c; --line:#1d232c;
+    --wildfires:#f06a4f; --severeStorms:#8f9ff0; --volcanoes:#f0a24f;
+    --seaLakeIce:#7cc7e8; --earthquakes:#e8e07c; --other:#9aa3b0;
+  }
+  *{box-sizing:border-box;margin:0;padding:0}
+  html,body{height:100%}
+  body{background:var(--bg);color:var(--ink);font-family:ui-monospace,'SF Mono',Menlo,Consolas,monospace;overflow:hidden}
+  #app{display:grid;grid-template-columns:380px 1fr;height:100vh}
+  @media(max-width:820px){#app{grid-template-columns:1fr;grid-template-rows:1fr 1fr}}
+
+  /* left panel */
+  #panel{border-right:1px solid var(--line);display:flex;flex-direction:column;min-height:0}
+  header{padding:18px 18px 14px;border-bottom:1px solid var(--line)}
+  h1{font-size:15px;letter-spacing:.3em;font-weight:600}
+  h1 span{color:var(--dim)}
+  .sub{color:var(--dim);font-size:10px;margin-top:5px;letter-spacing:.05em}
+  .brief{padding:12px 18px;border-bottom:1px solid var(--line);font-size:11px;color:var(--dim);line-height:1.7}
+  .brief b{color:var(--ink);font-weight:400}
+  #chips{display:flex;flex-wrap:wrap;gap:6px;padding:12px 18px;border-bottom:1px solid var(--line)}
+  .chip{background:transparent;border:1px solid var(--line);color:var(--dim);font:inherit;font-size:10px;padding:4px 10px;border-radius:20px;cursor:pointer;letter-spacing:.06em}
+  .chip:hover{color:var(--ink)}
+  .chip.on{color:var(--bg);background:var(--ink);border-color:var(--ink)}
+  #list{flex:1;overflow-y:auto;min-height:0}
+  .ev{padding:12px 18px;border-bottom:1px solid var(--line);cursor:pointer}
+  .ev:hover{background:#12161c}
+  .ev.sel{background:#141a22;border-left:2px solid var(--ink)}
+  .ev-cat{font-size:9px;letter-spacing:.2em;text-transform:uppercase}
+  .ev-title{font-size:13px;margin-top:4px;line-height:1.4}
+  .ev-meta{font-size:10px;color:var(--dim);margin-top:4px}
+  .status{padding:24px 18px;color:var(--dim);font-size:12px;text-align:center}
+
+  /* detail drawer */
+  #detail{border-top:1px solid var(--line);padding:14px 18px;font-size:11px;display:none}
+  #detail h2{font-size:13px;margin-bottom:8px;letter-spacing:.02em}
+  #detail .d-row{color:var(--dim);margin:4px 0;line-height:1.6}
+  #detail a{color:#7cc7e8;text-decoration:none}
+  #detail a:hover{text-decoration:underline}
+  #detail .close{position:absolute}
+
+  #map{background:var(--bg)}
+  .mk{border-radius:50%;border:2px solid rgba(255,255,255,.85);box-shadow:0 0 12px rgba(255,255,255,.15)}
+  .leaflet-container{background:var(--bg);font:inherit}
+  .leaflet-popup-content-wrapper{background:var(--panel);color:var(--ink);font:inherit;border-radius:6px}
+  .leaflet-popup-tip{background:var(--panel)}
+  .leaflet-popup-content{font-size:12px;line-height:1.5}
+  .leaflet-bar a{background:var(--panel);color:var(--ink);border-color:var(--line)}
+  .credit{position:absolute;bottom:8px;right:10px;font-size:9px;color:#454d58;z-index:500;letter-spacing:.05em}
+</style>
+</head>
+<body>
+<div id="app">
+  <div id="panel">
+    <header>
+      <h1>TERRA<span>SCOPE</span></h1>
+      <div class="sub">NASA EONET · EARTH EVENT BRIEFING · LIVE</div>
+    </header>
+    <div class="brief" id="brief">acquiring planetary feed…</div>
+    <div id="chips"></div>
+    <div id="list"><div class="status">contacting eonet.gsfc.nasa.gov…</div></div>
+    <div id="detail"></div>
+  </div>
+  <div style="position:relative;min-height:0">
+    <div id="map"></div>
+    <div class="credit">events: NASA EONET v3 · tiles: CARTO/OSM</div>
+  </div>
+</div>
+<script src="https://unpkg.com/leaflet@1.9.4/dist/leaflet.js"></script>
+<script>
+(function(){
+  var CATCOLORS={wildfires:'#f06a4f',severeStorms:'#8f9ff0',volcanoes:'#f0a24f',seaLakeIce:'#7cc7e8',earthquakes:'#e8e07c'};
+  function col(cat){return CATCOLORS[cat]||'#9aa3b0'}
+  var map=L.map('map',{zoomControl:true,worldCopyJump:true}).setView([25,-10],2);
+  L.tileLayer('https://{s}.basemaps.cartocdn.com/dark_all/{z}/{x}/{y}{r}.png',{maxZoom:12,attribution:'© OpenStreetMap © CARTO'}).addTo(map);
+
+  var events=[], filter='all', markers=[], selId=null;
+  var list=document.getElementById('list'), brief=document.getElementById('brief'),
+      chips=document.getElementById('chips'), detail=document.getElementById('detail');
+
+  fetch('https://eonet.gsfc.nasa.gov/api/v3/events?status=open&limit=200')
+    .then(function(r){return r.json()})
+    .then(function(d){ events=d.events||[]; buildChips(); render(); })
+    .catch(function(){ list.innerHTML='<div class="status">feed unreachable - check connection</div>'; brief.textContent='signal lost'; });
+
+  function latestGeom(ev){ return (ev.geometry||[]).slice().sort(function(a,b){return new Date(a.date)-new Date(b.date)}).pop() }
+  function cats(){
+    var seen={};
+    events.forEach(function(e){(e.categories||[]).forEach(function(c){seen[c.id]=c.title})});
+    return Object.keys(seen).map(function(k){return {id:k,title:seen[k]}});
+  }
+  function buildChips(){
+    chips.innerHTML='';
+    [['all','all']].concat(cats().map(function(c){return [c.id,c.title]})).forEach(function(p){
+      var b=document.createElement('button'); b.className='chip'+(p[0]===filter?' on':'');
+      b.textContent=p[1]; b.onclick=function(){filter=p[0];selId=null;buildChips();render()};
+      chips.appendChild(b);
+    });
+  }
+  function render(){
+    markers.forEach(function(m){map.removeLayer(m)}); markers=[];
+    var shown=events.filter(function(e){
+      return filter==='all'||(e.categories||[]).some(function(c){return c.id===filter});
+    });
+    // briefing
+    var byCat={};
+    shown.forEach(function(e){(e.categories||[]).forEach(function(c){byCat[c.title]=(byCat[c.title]||0)+1})});
+    var parts=Object.keys(byCat).sort(function(a,b){return byCat[b]-byCat[a]}).slice(0,4)
+      .map(function(k){return '<b>'+byCat[k]+'</b> '+k.toLowerCase()});
+    brief.innerHTML='<b>'+shown.length+'</b> active events tracked right now'+(parts.length?' — '+parts.join(' · '):'')
+      +'<br>source: NASA EONET · updated '+new Date().toLocaleTimeString(undefined,{hour:'numeric',minute:'2-digit'});
+
+    list.innerHTML='';
+    if(!shown.length){list.innerHTML='<div class="status">no active events in this class</div>'}
+    shown.forEach(function(e){
+      var g=latestGeom(e); if(!g) return;
+      var cat=(e.categories&&e.categories[0])||{id:'',title:'Event'};
+      var row=document.createElement('div'); row.className='ev'+(e.id===selId?' sel':'');
+      var c=col(cat.id);
+      row.innerHTML='<div class="ev-cat" style="color:'+c+'">'+cat.title+'</div>'+
+        '<div class="ev-title"></div>'+
+        '<div class="ev-meta">'+new Date(g.date).toLocaleString(undefined,{month:'short',day:'numeric',hour:'numeric',minute:'2-digit'})+'</div>';
+      row.querySelector('.ev-title').textContent=e.title;
+      row.onclick=function(){select(e.id,true)};
+      list.appendChild(row);
+
+      var ll=[g.coordinates[1],g.coordinates[0]];
+      var m=L.marker?null:null;
+      var mk=L.marker(ll,{icon:L.divIcon({className:'',html:'<div class="mk" style="width:11px;height:11px;background:'+c+'"></div>',iconSize:[15,15],iconAnchor:[7,7]})});
+      mk.addTo(map).on('click',function(){select(e.id,false)});
+      markers.push(mk);
+    });
+  }
+  function select(id,pan){
+    selId=id; render();
+    var e=events.find(function(x){return x.id===id}); if(!e) return;
+    var g=latestGeom(e);
+    if(pan&&g) map.flyTo([g.coordinates[1],g.coordinates[0]],6,{duration:.8});
+    var cat=(e.categories&&e.categories[0])||{title:'Event'};
+    var track=(e.geometry||[]).slice(-5).reverse().map(function(p){
+      return new Date(p.date).toLocaleString(undefined,{month:'short',day:'numeric',hour:'numeric',minute:'2-digit'});
+    }).join(' · ');
+    var srcs=(e.sources||[]).map(function(s){return '<a href="'+s.url+'" target="_blank" rel="noopener">'+s.id+'</a>'}).join(' · ');
+    detail.style.display='block';
+    detail.innerHTML='<h2 style="color:'+col((e.categories&&e.categories[0]||{}).id)+'"></h2>'+
+      '<div class="d-row">'+cat.title.toUpperCase()+' · '+(e.closed?'CLOSED':'ACTIVE')+'</div>'+
+      (track?'<div class="d-row">track: '+track+'</div>':'')+
+      (srcs?'<div class="d-row">sources: '+srcs+'</div>':'')+
+      '<div class="d-row"><a href="https://eonet.gsfc.nasa.gov/api/v3/events/'+e.id+'" target="_blank" rel="noopener">raw EONET record ↗</a></div>';
+    detail.querySelector('h2').textContent=e.title;
+    detail.scrollIntoView();
+  }
+})();
+</script>
+</body>
+</html>
